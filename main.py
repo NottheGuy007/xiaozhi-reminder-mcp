@@ -58,31 +58,66 @@ xiaozhi_ws = None
 xiaozhi_lock = asyncio.Lock()
 
 async def xiaozhi_listener(ws_url: str, notifier):
-    """Background task that maintains connection to Xiaozhi and receives messages."""
+    """Maintain Xiaozhi websocket, reply to JSON-RPC initialize, keepalive, and reconnect."""
     backoff = 1
+    heartbeat_interval = 25
     while True:
         try:
             logger.info("Connecting to Xiaozhi websocket at %s", ws_url)
-            async with websockets.connect(ws_url) as websocket:
-                # Reset backoff after successful connect
+            async with websockets.connect(
+                ws_url,
+                ping_interval=heartbeat_interval,
+                ping_timeout=10,
+                max_size=None,
+            ) as websocket:
                 backoff = 1
-                # Keep a reference for sending messages
                 global xiaozhi_ws
                 async with xiaozhi_lock:
                     xiaozhi_ws = websocket
                 logger.info("Connected to Xiaozhi websocket")
-                # Receive loop: we accept messages and log them (no auth required)
+
                 async for message in websocket:
                     logger.info("Received message from Xiaozhi: %s", message)
-                    # If Xiaozhi sends reminder creation messages in some format,
-                    # you could parse them here and add into DB/scheduler.
-                    # For now we just log incoming messages.
+                    try:
+                        msg = json.loads(message)
+                    except Exception:
+                        logger.warning("Non-JSON message from Xiaozhi: %s", message)
+                        continue
+
+                    if isinstance(msg, dict) and "method" in msg:
+                        method = msg.get("method")
+                        mid = msg.get("id", None)
+
+                        if method == "initialize":
+                            resp = {
+                                "jsonrpc": "2.0",
+                                "id": mid,
+                                "result": {
+                                    "capabilities": {"ok": True},
+                                    "server": {"name": "xiaozhi-mcp", "version": "0.1.0"},
+                                },
+                            }
+                            try:
+                                await websocket.send(json.dumps(resp))
+                                logger.info("Sent initialize response (id=%s)", str(mid))
+                            except Exception as e:
+                                logger.error("Failed to send initialize response: %s", str(e))
+
+                        elif method in ("ping", "heartbeat"):
+                            if mid is not None:
+                                try:
+                                    await websocket.send(json.dumps({"jsonrpc": "2.0", "id": mid, "result": "pong"}))
+                                except Exception as e:
+                                    logger.error("Failed to reply to ping: %s", str(e))
+                        else:
+                            logger.info("Unhandled method %s (ignored)", method)
+
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.error("Xiaozhi websocket error: %s", str(e))
             await asyncio.sleep(min(backoff, 60))
-            backoff *= 2
+            backoff = min(backoff * 2, 60)
 
 async def send_to_xiaozhi(payload: dict):
     """Send a JSON payload back to Xiaozhi over the websocket if connected."""
@@ -115,13 +150,22 @@ def notify_callback(reminder_id: str):
             "text": r.text,
             "fired_at": datetime.utcnow().isoformat() + "Z",
         }
-        # Send asynchronously to Xiaozhi via background task
         asyncio.create_task(send_to_xiaozhi(payload))
         logger.info("Notification callback queued for reminder %s", r.id)
         return "queued"
     except Exception as e:
         logger.error("notify_callback error: %s", str(e))
         return "error"
+
+@app.get("/")
+async def root():
+    """Render health checks sometimes hit '/', return 200 not 404."""
+    return {"status": "ok"}
+
+@app.get("/healthz")
+async def healthz():
+    """Explicit health endpoint for platforms."""
+    return {"status": "ok"}
 
 @app.on_event("startup")
 async def startup_event():
@@ -131,9 +175,7 @@ async def startup_event():
         global scheduler_manager
         scheduler_manager = SchedulerManager(trigger_callback=notify_callback, cron_api_url=CRON_API_URL, cron_api_key=CRON_API_KEY, database_url=DATABASE_URL)
         scheduler_manager.start()
-        # load persisted reminders
         scheduler_manager.load_persisted_reminders()
-        # start xiaozhi listener in background
         asyncio.create_task(xiaozhi_listener(XIAOZHI_WS_URL, notify_callback))
         logger.info("Startup complete")
     except Exception as e:
@@ -165,7 +207,6 @@ async def create_reminder(reminder: CreateReminder, background_tasks: Background
         db.add(r)
         db.commit()
         db.refresh(r)
-        # schedule it
         added = scheduler_manager.add_reminder(r.id, r.text, r.user_id or "", r.cron or "", r.run_at)
         if not added:
             logger.error("Failed to schedule reminder %s", r.id)
