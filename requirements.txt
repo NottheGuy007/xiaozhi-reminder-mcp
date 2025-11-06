@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+websockets
+sqlalchemy
+psycopg2-binary
+apscheduler
+pydantic
+requests
+aiohttp
+python-dotenv
